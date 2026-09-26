@@ -19,6 +19,7 @@ from scripts.ci.tests.matrix_fixtures import SCHEMA1_MATRIX_PATH, schema2_config
 from scripts.ci.pr_gate import (
     CONTROLLER_UPGRADE_REQUIRED,
     CONTEXTS,
+    CONTROLLER_ANCHOR_WORKFLOW,
     EXACT_BASE_OWNED_PATHS,
     GateResult,
     GitHubApi,
@@ -39,6 +40,7 @@ from scripts.ci.pr_gate import (
     parse_restricted_transition,
     read_restricted_transition_owner_decision,
     reauthorize,
+    runs_default_controller,
     resolve_dispatch_source,
     resolve_pull_identity,
     select_newest_pull_run,
@@ -75,6 +77,18 @@ def identity(**overrides: object) -> PullIdentity:
     return PullIdentity(**values)  # type: ignore[arg-type]
 
 
+def anchor(
+    controller: str = DEFAULT, *, repository: str = "owner/repo", branch: str = "master"
+) -> dict[str, str]:
+    """The ``referenced_workflows`` entry GitHub records for the gates' local reusable call."""
+
+    return {
+        "path": f"{repository}/{CONTROLLER_ANCHOR_WORKFLOW}@{controller}",
+        "ref": f"refs/heads/{branch}",
+        "sha": controller,
+    }
+
+
 def run(
     run_id: int,
     *,
@@ -84,10 +98,14 @@ def run(
     conclusion: str | None = "success",
     created_at: str = "2026-08-10T10:00:00Z",
     pull: int = 17,
-    branch: str = "master",
-    head: str = DEFAULT,
+    branch: str = "feature/ui",
+    head: str = HEAD,
+    controller: str = DEFAULT,
+    repository: str = "owner/repo",
     event: str = "pull_request_target",
 ) -> dict[str, object]:
+    """A gate run as GitHub records it: under the PR head, naming its controller by reference."""
+
     return {
         "id": run_id,
         "run_attempt": attempt,
@@ -98,9 +116,10 @@ def run(
         "status": status,
         "conclusion": conclusion,
         "created_at": created_at,
-        "repository": {"full_name": "owner/repo"},
-        "head_repository": {"full_name": "owner/repo"},
+        "repository": {"full_name": repository},
+        "head_repository": {"full_name": repository},
         "pull_requests": [{"number": pull}],
+        "referenced_workflows": [anchor(controller, repository=repository)],
     }
 
 
@@ -270,6 +289,102 @@ class RunSelectionTests(unittest.TestCase):
             )
         )
 
+    def test_runs_name_their_controller_only_through_the_local_anchor(self) -> None:
+        # The shape GitHub records (run 36249851051): PR head branch and commit, controller by reference.
+        self.assertEqual(
+            SelectedRun(10, 1, "completed", "success", "2026-08-10T10:00:00Z"),
+            select_newest_pull_run(
+                [run(10)], workflow="build-gate.yml", repository="owner/repo", identity=identity()
+            ),
+        )
+        legacy_shape = run(11, branch="master", head=DEFAULT)
+        stale_controller = run(12, controller="f" * 40)
+        other_ref = run(13)
+        other_ref["referenced_workflows"] = [{**anchor(), "ref": "refs/heads/feature/ui"}]
+        other_sha = run(20)
+        other_sha["referenced_workflows"] = [{**anchor(), "sha": "f" * 40}]
+        # A remote reference names a branch: GitHub records its resolved commit but not in the path.
+        remote_ref = run(21)
+        remote_ref["referenced_workflows"] = [
+            {**anchor(), "path": f"owner/repo/{CONTROLLER_ANCHOR_WORKFLOW}@master"}
+        ]
+        doubled_reversed = run(22)
+        doubled_reversed["referenced_workflows"] = [anchor("f" * 40), anchor()]
+        default_branch_only = run(23, branch="master")
+        default_head_only = run(24, head=DEFAULT)
+        unreferenced = run(14)
+        del unreferenced["referenced_workflows"]
+        doubled = run(15)
+        doubled["referenced_workflows"] = [anchor(), anchor("f" * 40)]
+        foreign_anchor = run(16)
+        foreign_anchor["referenced_workflows"] = [anchor(repository="attacker/repo")]
+        other_head = run(17, head="f" * 40)
+        other_branch = run(18, branch="feature/other")
+        for record in (
+            legacy_shape, stale_controller, other_ref, other_sha, remote_ref, unreferenced,
+            doubled, doubled_reversed, foreign_anchor, other_head, other_branch,
+            default_branch_only, default_head_only,
+        ):
+            with self.subTest(record=record["id"]):
+                self.assertIsNone(
+                    select_newest_pull_run(
+                        [record], workflow="build-gate.yml", repository="owner/repo",
+                        identity=identity(),
+                    )
+                )
+        extra = run(19)
+        extra["referenced_workflows"].append(
+            {"path": "owner/repo/.github/workflows/other.yml@" + DEFAULT,
+             "ref": "refs/heads/master", "sha": DEFAULT}
+        )
+        self.assertTrue(
+            runs_default_controller(
+                extra, repository="owner/repo", default_branch="master", default_sha=DEFAULT
+            )
+        )
+        for malformed in (None, "anchor", [None], [{"path": 7}]):
+            with self.subTest(malformed=malformed):
+                self.assertFalse(
+                    runs_default_controller(
+                        {"referenced_workflows": malformed}, repository="owner/repo",
+                        default_branch="master", default_sha=DEFAULT,
+                    )
+                )
+
+    def test_a_cancelled_concurrency_sibling_never_shadows_a_run_that_ran(self) -> None:
+        # PR 15's Build pair: opened + labeled started 92 and 93 in the same second, and the
+        # concurrency group cancelled 93 although it has the higher id.
+        survivor = run(36251236264, created_at="2026-09-26T15:14:24Z")
+        cancelled = run(36251236289, created_at="2026-09-26T15:14:24Z", conclusion="cancelled")
+        later_cancelled = run(36251236290, created_at="2026-09-26T15:14:25Z", conclusion="cancelled")
+        for records in ([survivor, cancelled], [cancelled, survivor], [survivor, later_cancelled]):
+            with self.subTest(records=[record["id"] for record in records]):
+                self.assertEqual(
+                    36251236264,
+                    select_newest_pull_run(
+                        records, workflow="build-gate.yml", repository="owner/repo",
+                        identity=identity(),
+                    ).run_id,
+                )
+        newer_failure = run(36251236300, created_at="2026-09-26T15:20:00Z", conclusion="failure")
+        newer_pending = run(
+            36251236301, created_at="2026-09-26T15:21:00Z", status="in_progress", conclusion=None
+        )
+        for newer in (newer_failure, newer_pending):
+            with self.subTest(newer=newer["id"]):
+                self.assertEqual(
+                    newer["id"],
+                    select_newest_pull_run(
+                        [survivor, cancelled, newer], workflow="build-gate.yml",
+                        repository="owner/repo", identity=identity(),
+                    ).run_id,
+                )
+        only_cancelled = select_newest_pull_run(
+            [cancelled, later_cancelled], workflow="build-gate.yml", repository="owner/repo",
+            identity=identity(),
+        )
+        self.assertEqual((36251236290, "cancelled"), (only_cancelled.run_id, only_cancelled.conclusion))
+
     def test_legacy_pull_request_run_is_not_protected_evidence(self) -> None:
         self.assertIsNone(
             select_newest_pull_run(
@@ -378,6 +493,16 @@ class ArtifactAndGraphTests(unittest.TestCase):
         self.assertEqual("failure", rejected.state)
 
 
+class ControllerAnchorWorkflowTests(unittest.TestCase):
+    def test_both_gates_call_the_anchor_through_a_repository_local_reference(self) -> None:
+        # A pull_request_target run resolves a local ``uses:`` from the default branch at its exact commit.
+        self.assertTrue((REPO / CONTROLLER_ANCHOR_WORKFLOW).is_file())
+        for workflow in ("build-gate.yml", "on-demand-e2e.yml"):
+            text = (REPO / ".github/workflows" / workflow).read_text(encoding="utf-8")
+            with self.subTest(workflow=workflow):
+                self.assertEqual(1, text.count(f"    uses: ./{CONTROLLER_ANCHOR_WORKFLOW}\n"))
+
+
 class PullIdentityTests(unittest.TestCase):
     class Api:
         repository = "owner/repo"
@@ -469,7 +594,11 @@ class PullIdentityTests(unittest.TestCase):
         foreign["head_repository"] = {"full_name": "attacker/repo"}
         invalid.append(foreign)
         invalid.append(run(51, branch="ship/stable"))
-        invalid.append(run(51, head="f" * 40))
+        invalid.append(run(51, branch="master"))
+        invalid.append(run(51, controller="f" * 40))
+        unreferenced = run(51)
+        del unreferenced["referenced_workflows"]
+        invalid.append(unreferenced)
         for record in invalid:
             with self.subTest(record=record), self.assertRaises(NotEligible):
                 resolve_pull_identity(
@@ -477,6 +606,12 @@ class PullIdentityTests(unittest.TestCase):
                     trigger_run_id=51,
                     implementation_sha=DEFAULT,
                 )
+
+    def test_trigger_from_an_older_head_still_evaluates_the_current_head(self) -> None:
+        current = resolve_pull_identity(
+            self.Api(run_record=run(51, head="f" * 40)), trigger_run_id=51, implementation_sha=DEFAULT
+        )
+        self.assertEqual(identity(base_branch="ship/stable"), current)
 
     def test_trigger_and_pull_associations_are_exactly_one_and_same_repository(self) -> None:
         ambiguous = run(51)
@@ -1276,9 +1411,9 @@ class RestrictedTransitionEvaluationTests(unittest.TestCase):
             super().__init__(comments)
             self.current, self.runs, self.job_records, self.artifact_records = current, {}, {}, {}
             for run_id, workflow in ((51, "build-gate.yml"), (52, "on-demand-e2e.yml")):
-                value = run(run_id, workflow=workflow, head=current.default_sha)
-                for field in ("repository", "head_repository"):
-                    value[field]["full_name"] = self.repository
+                value = run(run_id, workflow=workflow, branch=current.head_branch,
+                            head=current.head_sha, controller=current.default_sha,
+                            repository=self.repository)
                 self.runs[workflow] = [value]
                 self.job_records[run_id] = [
                     {"id": run_id * 100 + index, "name": item.name, "run_attempt": 1,

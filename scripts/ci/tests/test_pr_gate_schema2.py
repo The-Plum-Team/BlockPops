@@ -20,6 +20,7 @@ from scripts.ci.e2e_job_graph import expected_jobs
 from scripts.ci.gate_controller import GateControllerError, PROTECTED_PATHS, validate_controller_parity
 from scripts.ci.pr_gate import (
     CONTEXTS,
+    CONTROLLER_ANCHOR_WORKFLOW,
     CONTROLLER_UPGRADE_DIRECTORY_ROOTS,
     CONTROLLER_UPGRADE_REQUIRED,
     EXACT_BASE_OWNED_PATHS,
@@ -116,9 +117,13 @@ class FakeGitHub:
         return [{
             "id": self.run_ids[kind], "run_attempt": 1, "status": "completed", "conclusion": "success",
             "created_at": "2026-09-26T10:00:00Z", "event": "pull_request_target",
-            "path": f".github/workflows/{workflow}", "head_branch": "master",
-            "head_sha": self.identity.default_sha, "repository": {"full_name": REPOSITORY_NAME},
+            "path": f".github/workflows/{workflow}", "head_branch": self.identity.head_branch,
+            "head_sha": self.identity.head_sha, "repository": {"full_name": REPOSITORY_NAME},
             "head_repository": {"full_name": REPOSITORY_NAME}, "pull_requests": [{"number": 10}],
+            "referenced_workflows": [{
+                "path": f"{REPOSITORY_NAME}/{CONTROLLER_ANCHOR_WORKFLOW}@{self.identity.default_sha}",
+                "ref": f"refs/heads/{self.identity.default_branch}", "sha": self.identity.default_sha,
+            }],
         }]
 
     def jobs(self, run_id: int) -> list[dict[str, Any]]:

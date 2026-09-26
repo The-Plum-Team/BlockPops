@@ -173,7 +173,14 @@ A protected default-branch `workflow_run` evaluator then treats completion
 events only as locators, repeats that identity check, requires the matrix and
 dependency-verification metadata to match the current base, verifies protected
 controller/bootstrap parity, selects the newest exact Build and Packaged E2E
-attempts, and authenticates their complete job graphs and artifacts. A separate
+attempts, and authenticates their complete job graphs and artifacts. GitHub
+records a `pull_request_target` run under the PR's head branch and commit, never
+the controller that ran it. A gate run is evidence only when it names the PR's
+current head and its `referenced_workflows` entry for the gates'
+repository-local `verify-gate-attestation.yml` call is the exact current default
+commit: GitHub runs `pull_request_target` from the default branch at event time,
+whatever the PR's base, and resolves that call there. A cancelled run never
+shadows a run of the same head that ran. A separate
 status-only GitHub App emits `Trusted PR / Build and verify` and
 `Trusted PR / Packaged E2E gate` on the current source head. The App writer has
 only an exact protected-default checkout for final reauthentication and has no

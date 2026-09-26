@@ -68,6 +68,14 @@ CONTEXTS = {
     "build": "Trusted PR / Build and verify",
     "e2e": "Trusted PR / Packaged E2E gate",
 }
+# GitHub records a ``pull_request_target`` run under the pull request's head branch and head
+# commit, never the controller that ran it. GitHub runs that workflow from the default branch at
+# event time, whatever the PR's base, and resolves its repository-local ``uses:`` there. Both
+# gates call this reusable workflow that way, so each run's ``referenced_workflows`` records the
+# exact default commit (path suffix, ``ref`` and ``sha``). That entry is how a gate run names its
+# controller; a remote reference such as ``…@master`` names a branch, not a commit, and never
+# matches.
+CONTROLLER_ANCHOR_WORKFLOW = ".github/workflows/verify-gate-attestation.yml"
 MATRIX_PATH = "release/release-matrix.json"
 VERIFICATION_PATH = "gradle/verification-metadata.xml"
 EXACT_BASE_OWNED_PATHS = (
@@ -603,6 +611,29 @@ def _authenticate_trigger(api: GitHubApi, trigger_run_id: int) -> tuple[dict[str
     return run, _run_pull_number(run, "trigger run")
 
 
+def runs_default_controller(
+    run: dict[str, Any], *, repository: str, default_branch: str, default_sha: str
+) -> bool:
+    """Whether GitHub records ``run`` as executing the exact default-branch controller."""
+
+    references = run.get("referenced_workflows")
+    if not isinstance(references, list):
+        return False
+    path = f"{repository}/{CONTROLLER_ANCHOR_WORKFLOW}@"
+    anchors = [
+        value for value in references
+        if isinstance(value, dict)
+        and isinstance(value.get("path"), str)
+        and value["path"].startswith(path)
+    ]
+    return (
+        len(anchors) == 1
+        and anchors[0].get("path") == path + default_sha
+        and anchors[0].get("ref") == f"refs/heads/{default_branch}"
+        and anchors[0].get("sha") == default_sha
+    )
+
+
 def resolve_pull_identity(
     api: GitHubApi,
     *,
@@ -627,8 +658,8 @@ def resolve_pull_identity(
     default_sha = api.branch_sha(default_branch)
     if default_sha != implementation_sha:
         raise NotEligible("protected default branch advanced during PR evaluation")
-    if trigger is not None and (
-        trigger["head_branch"] != default_branch or trigger["head_sha"] != default_sha
+    if trigger is not None and not runs_default_controller(
+        trigger, repository=api.repository, default_branch=default_branch, default_sha=default_sha
     ):
         raise NotEligible("trigger run is not from the exact current default controller")
 
@@ -654,6 +685,10 @@ def resolve_pull_identity(
         _fail("pull request branch identity is unsafe")
     if head_branch.startswith("automation/release-sync/"):
         raise NotEligible("release synchronization head is not an ordinary PR")
+    # A wake from an older head of this pull request still re-evaluates its current head, whose
+    # newest exact runs are selected below; a run of another branch is not this PR's evidence.
+    if trigger is not None and trigger["head_branch"] != head_branch:
+        raise NotEligible("trigger run is not from this pull request's head branch")
     if api.branch_sha(head_branch) != head_sha or api.branch_sha(base_branch) != base_sha:
         raise NotEligible("pull request branch heads changed during evaluation")
     merge_tree, parents = api.commit_identity(merge_sha)
@@ -1279,8 +1314,14 @@ def select_newest_pull_run(
         if (
             value.get("event") != "pull_request_target"
             or value.get("path") != path
-            or value.get("head_branch") != identity.default_branch
-            or value.get("head_sha") != identity.default_sha
+            or value.get("head_branch") != identity.head_branch
+            or value.get("head_sha") != identity.head_sha
+            or not runs_default_controller(
+                value,
+                repository=repository,
+                default_branch=identity.default_branch,
+                default_sha=identity.default_sha,
+            )
             or not isinstance(run_repository, dict)
             or run_repository.get("full_name") != repository
             or not isinstance(head_repository, dict)
@@ -1308,7 +1349,13 @@ def select_newest_pull_run(
         candidates.append((_timestamp(created_at, "workflow run created_at"), run_id, selected))
     if not candidates:
         return None
-    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+    # One PR event can start two runs of a gate in the same second (``opened`` with ``labeled``),
+    # and the gate's ``cancel-in-progress`` concurrency cancels whichever entered its group first,
+    # which neither the timestamp nor the run id reveals. Every candidate here is the same exact
+    # head under the same controller, so a cancelled run never shadows a sibling that ran: a newer
+    # failed or in-progress run still overrides an older success.
+    ran = [item for item in candidates if item[2].conclusion != "cancelled"]
+    return max(ran or candidates, key=lambda item: (item[0], item[1]))[2]
 
 
 def _expected_artifact_name(kind: str, identity: PullIdentity, attempt: int) -> str:
