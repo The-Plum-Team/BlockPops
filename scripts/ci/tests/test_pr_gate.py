@@ -303,6 +303,15 @@ class RunSelectionTests(unittest.TestCase):
         other_ref["referenced_workflows"] = [{**anchor(), "ref": "refs/heads/feature/ui"}]
         other_sha = run(20)
         other_sha["referenced_workflows"] = [{**anchor(), "sha": "f" * 40}]
+        # A remote reference names a branch: GitHub records its resolved commit but not in the path.
+        remote_ref = run(21)
+        remote_ref["referenced_workflows"] = [
+            {**anchor(), "path": f"owner/repo/{CONTROLLER_ANCHOR_WORKFLOW}@master"}
+        ]
+        doubled_reversed = run(22)
+        doubled_reversed["referenced_workflows"] = [anchor("f" * 40), anchor()]
+        default_branch_only = run(23, branch="master")
+        default_head_only = run(24, head=DEFAULT)
         unreferenced = run(14)
         del unreferenced["referenced_workflows"]
         doubled = run(15)
@@ -312,8 +321,9 @@ class RunSelectionTests(unittest.TestCase):
         other_head = run(17, head="f" * 40)
         other_branch = run(18, branch="feature/other")
         for record in (
-            legacy_shape, stale_controller, other_ref, other_sha, unreferenced, doubled,
-            foreign_anchor, other_head, other_branch,
+            legacy_shape, stale_controller, other_ref, other_sha, remote_ref, unreferenced,
+            doubled, doubled_reversed, foreign_anchor, other_head, other_branch,
+            default_branch_only, default_head_only,
         ):
             with self.subTest(record=record["id"]):
                 self.assertIsNone(
@@ -340,6 +350,40 @@ class RunSelectionTests(unittest.TestCase):
                         default_branch="master", default_sha=DEFAULT,
                     )
                 )
+
+    def test_a_cancelled_concurrency_sibling_never_shadows_a_run_that_ran(self) -> None:
+        # PR 15's Build pair: opened + labeled started 92 and 93 in the same second, and the
+        # concurrency group cancelled 93 although it has the higher id.
+        survivor = run(36251236264, created_at="2026-09-26T15:14:24Z")
+        cancelled = run(36251236289, created_at="2026-09-26T15:14:24Z", conclusion="cancelled")
+        later_cancelled = run(36251236290, created_at="2026-09-26T15:14:25Z", conclusion="cancelled")
+        for records in ([survivor, cancelled], [cancelled, survivor], [survivor, later_cancelled]):
+            with self.subTest(records=[record["id"] for record in records]):
+                self.assertEqual(
+                    36251236264,
+                    select_newest_pull_run(
+                        records, workflow="build-gate.yml", repository="owner/repo",
+                        identity=identity(),
+                    ).run_id,
+                )
+        newer_failure = run(36251236300, created_at="2026-09-26T15:20:00Z", conclusion="failure")
+        newer_pending = run(
+            36251236301, created_at="2026-09-26T15:21:00Z", status="in_progress", conclusion=None
+        )
+        for newer in (newer_failure, newer_pending):
+            with self.subTest(newer=newer["id"]):
+                self.assertEqual(
+                    newer["id"],
+                    select_newest_pull_run(
+                        [survivor, cancelled, newer], workflow="build-gate.yml",
+                        repository="owner/repo", identity=identity(),
+                    ).run_id,
+                )
+        only_cancelled = select_newest_pull_run(
+            [cancelled, later_cancelled], workflow="build-gate.yml", repository="owner/repo",
+            identity=identity(),
+        )
+        self.assertEqual((36251236290, "cancelled"), (only_cancelled.run_id, only_cancelled.conclusion))
 
     def test_legacy_pull_request_run_is_not_protected_evidence(self) -> None:
         self.assertIsNone(
@@ -451,7 +495,7 @@ class ArtifactAndGraphTests(unittest.TestCase):
 
 class ControllerAnchorWorkflowTests(unittest.TestCase):
     def test_both_gates_call_the_anchor_through_a_repository_local_reference(self) -> None:
-        # Only a local ``uses:`` is resolved from the base branch and recorded at its exact commit.
+        # A pull_request_target run resolves a local ``uses:`` from the default branch at its exact commit.
         self.assertTrue((REPO / CONTROLLER_ANCHOR_WORKFLOW).is_file())
         for workflow in ("build-gate.yml", "on-demand-e2e.yml"):
             text = (REPO / ".github/workflows" / workflow).read_text(encoding="utf-8")
@@ -550,6 +594,7 @@ class PullIdentityTests(unittest.TestCase):
         foreign["head_repository"] = {"full_name": "attacker/repo"}
         invalid.append(foreign)
         invalid.append(run(51, branch="ship/stable"))
+        invalid.append(run(51, branch="master"))
         invalid.append(run(51, controller="f" * 40))
         unreferenced = run(51)
         del unreferenced["referenced_workflows"]

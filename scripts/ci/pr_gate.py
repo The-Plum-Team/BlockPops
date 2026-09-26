@@ -69,9 +69,12 @@ CONTEXTS = {
     "e2e": "Trusted PR / Packaged E2E gate",
 }
 # GitHub records a ``pull_request_target`` run under the pull request's head branch and head
-# commit, never the controller that ran it. Both gates call this reusable workflow with a
-# repository-local ``uses:``, which GitHub resolves from the base branch, and it records that exact
-# commit in the run's ``referenced_workflows``. That entry is how a gate run names its controller.
+# commit, never the controller that ran it. GitHub runs that workflow from the default branch at
+# event time, whatever the PR's base, and resolves its repository-local ``uses:`` there. Both
+# gates call this reusable workflow that way, so each run's ``referenced_workflows`` records the
+# exact default commit (path suffix, ``ref`` and ``sha``). That entry is how a gate run names its
+# controller; a remote reference such as ``…@master`` names a branch, not a commit, and never
+# matches.
 CONTROLLER_ANCHOR_WORKFLOW = ".github/workflows/verify-gate-attestation.yml"
 MATRIX_PATH = "release/release-matrix.json"
 VERIFICATION_PATH = "gradle/verification-metadata.xml"
@@ -1346,7 +1349,13 @@ def select_newest_pull_run(
         candidates.append((_timestamp(created_at, "workflow run created_at"), run_id, selected))
     if not candidates:
         return None
-    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+    # One PR event can start two runs of a gate in the same second (``opened`` with ``labeled``),
+    # and the gate's ``cancel-in-progress`` concurrency cancels whichever entered its group first,
+    # which neither the timestamp nor the run id reveals. Every candidate here is the same exact
+    # head under the same controller, so a cancelled run never shadows a sibling that ran: a newer
+    # failed or in-progress run still overrides an older success.
+    ran = [item for item in candidates if item[2].conclusion != "cancelled"]
+    return max(ran or candidates, key=lambda item: (item[0], item[1]))[2]
 
 
 def _expected_artifact_name(kind: str, identity: PullIdentity, attempt: int) -> str:

@@ -116,7 +116,9 @@ bridge on a fresh same-repository PR before selecting the stable contexts in
 branch protection. Any repair uses the now-installed controller-upgrade process.
 The one exception is repairing the evaluator while it refuses every PR, as it
 did from the schema-2 `preparing` enrollment (`466426b`) until its trusted-gate
-projection landed. No controller upgrade can be admitted then, so that repair
+projection landed, and, because it never matched a real gate run, until gate
+runs were matched by their PR head and controller reference. No controller
+upgrade can be admitted then, so that repair
 lands as one exact, completely reviewed commit through the same governance
 process and limits as the first installation, followed by the same fresh-PR
 exercise of both protected gates before any stable context is relied on.
